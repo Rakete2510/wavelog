@@ -499,8 +499,9 @@ class User_Model extends CI_Model {
 
 		$username = $this->input->post('user_name', true);
 		$password = htmlspecialchars_decode($this->input->post('user_password', true));
+		$otp_code = $this->input->post('otp_code', true);
 
-		return $this->authenticate($username, $password);
+		return $this->authenticate($username, $password, $otp_code);
 	}
 
 	// FUNCTION: void clear_session()
@@ -650,9 +651,9 @@ class User_Model extends CI_Model {
 		}
 	}
 
-	// FUNCTION: bool authenticate($username, $password)
+	// FUNCTION: bool authenticate($username, $password, $otp_code = null)
 	// Authenticate a user against the users table
-	function authenticate($username, $password) {
+	function authenticate($username, $password, $otp_code = null) {
 		$u = $this->get($username);
 		if($u->num_rows() != 0) {
 			// direct login to clubstations are not allowed
@@ -674,6 +675,22 @@ class User_Model extends CI_Model {
 			}
 
 			if($this->_auth($password, $u->row()->user_password)) {
+				// Check if OTP is enabled for this user
+				if ($u->row()->otp_enabled == 1) {
+					if ($otp_code === null) {
+						// OTP code required but not provided
+						log_message('debug', "User ID: [{$u->row()->user_id}] OTP code required but not provided.");
+						return 4; // New return code for OTP required
+					}
+					
+					// Verify OTP code
+					if (!$this->verifyOtp($u->row()->user_id, $otp_code)) {
+						log_message('debug', "User ID: [{$u->row()->user_id}] Invalid OTP code provided.");
+						$this->db->query("UPDATE users SET login_attempts = login_attempts+1 WHERE user_id = ?", [$u->row()->user_id]);
+						return 5; // New return code for invalid OTP
+					}
+				}
+				
 				$this->db->query("UPDATE users SET login_attempts = 0 WHERE user_id = ?", [$u->row()->user_id]);	// Reset failurecount
 				if (ENVIRONMENT != "maintenance") {
 					return 1;
@@ -1022,6 +1039,215 @@ class User_Model extends CI_Model {
 		}
 	}
 
-}
+	// =============================================
+	// OTP/2FA RELATED METHODS
+	// =============================================
 
-?>
+	/**
+	 * Generate and store OTP secret for user
+	 * 
+	 * @param int $user_id User ID
+	 * @return string Generated secret
+	 */
+	public function generateOtpSecret($user_id) {
+		if (!$this->load->is_loaded('totp')) {
+			$this->load->library('totp');
+		}
+		
+		$secret = $this->totp->generateSecret(32);
+		
+		$this->db->where('user_id', $user_id);
+		$this->db->update('users', array('otp_secret' => $secret));
+		
+		return $secret;
+	}
+
+	/**
+	 * Enable OTP for user and generate backup codes
+	 * 
+	 * @param int $user_id User ID
+	 * @return array Generated backup codes
+	 */
+	public function enableOtp($user_id) {
+		if (!$this->load->is_loaded('totp')) {
+			$this->load->library('totp');
+		}
+		
+		$backupCodes = $this->totp->generateBackupCodes(8);
+		
+		$data = array(
+			'otp_enabled' => 1,
+			'otp_backup_codes' => json_encode($backupCodes)
+		);
+		
+		$this->db->where('user_id', $user_id);
+		$this->db->update('users', $data);
+		
+		return $backupCodes;
+	}
+
+	/**
+	 * Disable OTP for user
+	 * 
+	 * @param int $user_id User ID
+	 * @return bool Success
+	 */
+	public function disableOtp($user_id) {
+		$data = array(
+			'otp_enabled' => 0,
+			'otp_secret' => NULL,
+			'otp_backup_codes' => NULL,
+			'otp_last_used' => NULL
+		);
+		
+		$this->db->where('user_id', $user_id);
+		return $this->db->update('users', $data);
+	}
+
+	/**
+	 * Verify OTP code for user
+	 * 
+	 * @param int $user_id User ID
+	 * @param string $code OTP code
+	 * @return bool True if valid
+	 */
+	public function verifyOtp($user_id, $code) {
+		if (!$this->load->is_loaded('totp')) {
+			$this->load->library('totp');
+		}
+		
+		$user = $this->get_by_id($user_id)->row();
+		
+		if (!$user || !$user->otp_enabled || !$user->otp_secret) {
+			return false;
+		}
+		
+		// Check if it's a backup code
+		if (strlen($code) > 6) {
+			return $this->verifyBackupCode($user_id, $code);
+		}
+		
+		// Verify TOTP code
+		$isValid = $this->totp->verifyCode($user->otp_secret, $code);
+		
+		if ($isValid) {
+			// Update last used timestamp to prevent replay attacks
+			$this->db->where('user_id', $user_id);
+			$this->db->update('users', array('otp_last_used' => date('Y-m-d H:i:s')));
+		}
+		
+		return $isValid;
+	}
+
+	/**
+	 * Verify backup code for user
+	 * 
+	 * @param int $user_id User ID
+	 * @param string $code Backup code
+	 * @return bool True if valid
+	 */
+	public function verifyBackupCode($user_id, $code) {
+		if (!$this->load->is_loaded('totp')) {
+			$this->load->library('totp');
+		}
+		
+		$user = $this->get_by_id($user_id)->row();
+		
+		if (!$user || !$user->otp_enabled || !$user->otp_backup_codes) {
+			return false;
+		}
+		
+		$backupCodes = json_decode($user->otp_backup_codes, true);
+		if (!$backupCodes) {
+			return false;
+		}
+		
+		$usedCodeIndex = $this->totp->verifyBackupCode($code, $backupCodes);
+		
+		if ($usedCodeIndex !== false) {
+			// Remove used backup code
+			unset($backupCodes[$usedCodeIndex]);
+			$backupCodes = array_values($backupCodes); // Re-index array
+			
+			$this->db->where('user_id', $user_id);
+			$this->db->update('users', array('otp_backup_codes' => json_encode($backupCodes)));
+			
+			return true;
+		}
+		
+		return false;
+	}
+
+	/**
+	 * Get user's OTP status
+	 * 
+	 * @param int $user_id User ID
+	 * @return array OTP status information
+	 */
+	public function getOtpStatus($user_id) {
+		$user = $this->get_by_id($user_id)->row();
+		
+		if (!$user) {
+			return array(
+				'enabled' => false,
+				'has_secret' => false,
+				'backup_codes_count' => 0
+			);
+		}
+		
+		$backupCodes = $user->otp_backup_codes ? json_decode($user->otp_backup_codes, true) : array();
+		
+		return array(
+			'enabled' => (bool)$user->otp_enabled,
+			'has_secret' => !empty($user->otp_secret),
+			'backup_codes_count' => count($backupCodes)
+		);
+	}
+
+	/**
+	 * Get QR code URL for OTP setup
+	 * 
+	 * @param int $user_id User ID
+	 * @return string|false QR code URL or false if no secret
+	 */
+	public function getOtpQrUrl($user_id) {
+		if (!$this->load->is_loaded('totp')) {
+			$this->load->library('totp');
+		}
+		
+		$user = $this->get_by_id($user_id)->row();
+		
+		if (!$user || !$user->otp_secret) {
+			return false;
+		}
+		
+		$issuer = $this->config->item('application_name') ?: 'Wavelog';
+		return $this->totp->getQRCodeUrl($user->otp_secret, $user->user_callsign, $issuer);
+	}
+
+	/**
+	 * Regenerate backup codes for user
+	 * 
+	 * @param int $user_id User ID
+	 * @return array|false New backup codes or false if OTP not enabled
+	 */
+	public function regenerateBackupCodes($user_id) {
+		if (!$this->load->is_loaded('totp')) {
+			$this->load->library('totp');
+		}
+		
+		$user = $this->get_by_id($user_id)->row();
+		
+		if (!$user || !$user->otp_enabled) {
+			return false;
+		}
+		
+		$backupCodes = $this->totp->generateBackupCodes(8);
+		
+		$this->db->where('user_id', $user_id);
+		$this->db->update('users', array('otp_backup_codes' => json_encode($backupCodes)));
+		
+		return $backupCodes;
+	}
+
+}

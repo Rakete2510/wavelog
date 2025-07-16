@@ -1113,6 +1113,27 @@ class User extends CI_Controller {
 			} else if ($login_attempt === 3) {
 				$this->session->set_flashdata('warning', __("Your account is locked, due to too many failed login-attempts. Please reset your password."));
 				redirect('user/login');
+			} else if ($login_attempt === 4) {
+				// OTP code required - show OTP field on login form
+				$this->session->set_flashdata('otp_required', true);
+				$this->session->set_flashdata('info', __("Please enter your two-factor authentication code."));
+				$data['page_title'] = __("Login");
+				$data['https_check'] = $this->https_check();
+				$data['show_otp'] = true;
+				$this->load->view('interface_assets/mini_header', $data);
+				$this->load->view('user/login', $data);
+				$this->load->view('interface_assets/footer');
+				return;
+			} else if ($login_attempt === 5) {
+				$this->session->set_flashdata('error', __("Invalid two-factor authentication code!"));
+				$this->session->set_flashdata('otp_required', true);
+				$data['page_title'] = __("Login");
+				$data['https_check'] = $this->https_check();
+				$data['show_otp'] = true;
+				$this->load->view('interface_assets/mini_header', $data);
+				$this->load->view('user/login', $data);
+				$this->load->view('interface_assets/footer');
+				return;
 			} else {
 				if(ENVIRONMENT == 'maintenance') {
 					$this->session->set_flashdata('notice', __("Sorry. This instance is currently in maintenance mode. If this message appears unexpectedly or keeps showing up, please contact an administrator. Only administrators are currently allowed to log in."));
@@ -1609,5 +1630,204 @@ class User extends CI_Controller {
 		// log out on the regular way
 		$msg = ['notice', sprintf(__("You have been logged out of the account %s. Welcome back, %s, to your personal account!"), $club->user_callsign, $source_user->user_callsign)];
 		$this->logout($msg, false);
+	}
+
+	// =============================================
+	// OTP/2FA METHODS
+	// =============================================
+
+	/**
+	 * OTP verification page for users with 2FA enabled
+	 */
+	function verify_otp() {
+		// Check if there's a pending user for OTP verification
+		$pending_user = $this->session->userdata('otp_pending_user');
+		if (!$pending_user) {
+			$this->session->set_flashdata('error', __("No pending authentication found."));
+			redirect('user/login');
+		}
+
+		$this->load->library('form_validation');
+		$this->form_validation->set_rules('otp_code', 'OTP Code', 'required');
+
+		$data['page_title'] = __("Two-Factor Authentication");
+
+		if ($this->form_validation->run() == FALSE) {
+			$this->load->view('interface_assets/mini_header', $data);
+			$this->load->view('user/verify_otp');
+			$this->load->view('interface_assets/footer');
+		} else {
+			$otp_code = $this->input->post('otp_code', true);
+			$this->load->model('user_model');
+			
+			$user_query = $this->user_model->get($pending_user);
+			if ($user_query->num_rows() == 0) {
+				$this->session->set_flashdata('error', __("User not found."));
+				redirect('user/login');
+			}
+
+			$user = $user_query->row();
+			
+			// Verify OTP code
+			if ($this->user_model->verifyOtp($user->user_id, $otp_code)) {
+				// Clear pending session
+				$this->session->unset_userdata('otp_pending_user');
+				
+				// Complete login
+				$this->user_model->update_session($user->user_id);
+				$this->user_model->set_last_seen($user->user_id);
+				
+				$cookie = array(
+					'name'   => $this->config->item('gettext_cookie', 'gettext'),
+					'value'  => $user->user_language,
+					'expire' => 1000,
+					'secure' => FALSE
+				);
+				$this->input->set_cookie($cookie);
+
+				redirect('dashboard');
+			} else {
+				$this->session->set_flashdata('error', __("Invalid authentication code!"));
+				redirect('user/verify_otp');
+			}
+		}
+	}
+
+	/**
+	 * OTP setup page for enabling 2FA
+	 */
+	function setup_otp() {
+		$this->load->model('user_model');
+		
+		if(!$this->user_model->authorize(2)) { 
+			$this->session->set_flashdata('error', __("You're not allowed to do that!")); 
+			redirect('dashboard'); 
+		}
+
+		$user_id = $this->session->userdata('user_id');
+		$otp_status = $this->user_model->getOtpStatus($user_id);
+
+		$data['page_title'] = __("Two-Factor Authentication Setup");
+		$data['otp_status'] = $otp_status;
+
+		if ($otp_status['enabled']) {
+			// Already enabled, show management interface
+			$this->load->view('interface_assets/header', $data);
+			$this->load->view('user/otp_manage');
+			$this->load->view('interface_assets/footer');
+		} else {
+			// Setup new OTP
+			if (!$otp_status['has_secret']) {
+				// Generate new secret
+				$secret = $this->user_model->generateOtpSecret($user_id);
+			}
+			
+			$qr_url = $this->user_model->getOtpQrUrl($user_id);
+			$data['qr_url'] = $qr_url;
+			
+			$this->load->view('interface_assets/header', $data);
+			$this->load->view('user/otp_setup');
+			$this->load->view('interface_assets/footer');
+		}
+	}
+
+	/**
+	 * Enable OTP after verification
+	 */
+	function enable_otp() {
+		$this->load->model('user_model');
+		
+		if(!$this->user_model->authorize(2)) { 
+			$this->session->set_flashdata('error', __("You're not allowed to do that!")); 
+			redirect('dashboard'); 
+		}
+
+		$this->load->library('form_validation');
+		$this->form_validation->set_rules('otp_code', 'OTP Code', 'required');
+
+		if ($this->form_validation->run() == FALSE) {
+			$this->session->set_flashdata('error', __("Please provide a valid OTP code."));
+			redirect('user/setup_otp');
+		}
+
+		$user_id = $this->session->userdata('user_id');
+		$otp_code = $this->input->post('otp_code', true);
+
+		// Verify the code before enabling
+		if ($this->user_model->verifyOtp($user_id, $otp_code)) {
+			$backup_codes = $this->user_model->enableOtp($user_id);
+			
+			$this->session->set_flashdata('success', __("Two-factor authentication has been enabled successfully!"));
+			$this->session->set_userdata('new_backup_codes', $backup_codes);
+			redirect('user/setup_otp');
+		} else {
+			$this->session->set_flashdata('error', __("Invalid OTP code. Please try again."));
+			redirect('user/setup_otp');
+		}
+	}
+
+	/**
+	 * Disable OTP
+	 */
+	function disable_otp() {
+		$this->load->model('user_model');
+		
+		if(!$this->user_model->authorize(2)) { 
+			$this->session->set_flashdata('error', __("You're not allowed to do that!")); 
+			redirect('dashboard'); 
+		}
+
+		$user_id = $this->session->userdata('user_id');
+		
+		if ($this->user_model->disableOtp($user_id)) {
+			$this->session->set_flashdata('success', __("Two-factor authentication has been disabled."));
+		} else {
+			$this->session->set_flashdata('error', __("Failed to disable two-factor authentication."));
+		}
+		
+		redirect('user/setup_otp');
+	}
+
+	/**
+	 * Regenerate backup codes
+	 */
+	function regenerate_backup_codes() {
+		$this->load->model('user_model');
+		
+		if(!$this->user_model->authorize(2)) { 
+			$this->session->set_flashdata('error', __("You're not allowed to do that!")); 
+			redirect('dashboard'); 
+		}
+
+		$user_id = $this->session->userdata('user_id');
+		$backup_codes = $this->user_model->regenerateBackupCodes($user_id);
+		
+		if ($backup_codes) {
+			$this->session->set_flashdata('success', __("New backup codes have been generated."));
+			$this->session->set_userdata('new_backup_codes', $backup_codes);
+		} else {
+			$this->session->set_flashdata('error', __("Failed to generate backup codes."));
+		}
+		
+		redirect('user/setup_otp');
+	}
+
+	/**
+	 * AJAX endpoint to get QR code data
+	 */
+	function get_otp_qr() {
+		$this->load->model('user_model');
+		
+		if(!$this->user_model->authorize(2)) { 
+			header('Content-Type: application/json');
+			echo json_encode(['error' => 'Unauthorized']);
+			return;
+		}
+
+		$user_id = $this->session->userdata('user_id');
+		$qr_url = $this->user_model->getOtpQrUrl($user_id);
+		
+		header('Content-Type: application/json');
+		echo json_encode(['qr_url' => $qr_url]);
 	}
 }

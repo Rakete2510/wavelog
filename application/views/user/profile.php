@@ -48,6 +48,7 @@
 </table>	
 
 <a class="btn btn-primary" href="<?php echo site_url('user/edit')."/".$this->session->userdata('user_id'); ?>"><?= __("Edit profile"); ?></a>
+<a class="btn btn-secondary ml-2" href="<?php echo site_url('user/setup_otp'); ?>"><?= __("Two-Factor Authentication"); ?></a>
   </div>
 </div>
 

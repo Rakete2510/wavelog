@@ -73,6 +73,14 @@
                     <label for="floatingPassword"><strong><?= __("Password"); ?></strong></label>
                     <input type="password" name="user_password" class="form-control" id="floatingPassword" placeholder="<?php if (file_exists('.demo')) { echo "demo"; } else { echo __("Password"); } ?>">
                 </div>
+                <div class="mb-2" id="otpField" style="display: <?php echo (isset($show_otp) && $show_otp) ? 'block' : 'none'; ?>;">
+                    <label for="otp_code"><strong><?= __("2FA Code"); ?></strong></label>
+                    <input type="text" name="otp_code" class="form-control text-center" id="otp_code" 
+                           placeholder="000000" maxlength="8" pattern="[0-9A-Z\-]+" 
+                           autocomplete="one-time-code" value="<?php echo $this->input->post('otp_code'); ?>"
+                           style="font-family: monospace; letter-spacing: 0.2rem;">
+                    <div class="form-text"><?= __("Enter the 6-digit code from your app, or backup code"); ?></div>
+                </div>
                 <div class="mb-2">
                     <div class="row">
                         <div class="col text-start">
@@ -93,3 +101,62 @@
         </div>
     </div>
 </main>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const form = document.querySelector('form[name="users"]');
+    const otpField = document.getElementById('otpField');
+    const otpInput = document.getElementById('otp_code');
+    
+    // Check if OTP field should be visible and focus on it
+    <?php if (isset($show_otp) && $show_otp): ?>
+    if (otpInput) {
+        otpInput.focus();
+    }
+    <?php endif; ?>
+    
+    // Format OTP input as user types
+    if (otpInput) {
+        otpInput.addEventListener('input', function(e) {
+            let value = e.target.value.replace(/[^0-9A-Z\-]/g, '').toUpperCase();
+            
+            // If it's a 6-digit code, format with spaces for better readability
+            if (value.length <= 6 && !value.includes('-')) {
+                value = value.replace(/(.{3})(.{1,3})/, '$1 $2').trim();
+            }
+            
+            e.target.value = value;
+        });
+        
+        otpInput.addEventListener('paste', function(e) {
+            setTimeout(() => {
+                let value = e.target.value.replace(/[^0-9A-Z\-]/g, '').toUpperCase();
+                e.target.value = value;
+            }, 10);
+        });
+        
+        // Submit form when 6 digits are entered (without spaces)
+        otpInput.addEventListener('input', function(e) {
+            const cleanValue = e.target.value.replace(/\s/g, '');
+            if (cleanValue.length === 6 && !cleanValue.includes('-')) {
+                // Auto-submit after short delay
+                setTimeout(() => {
+                    form.submit();
+                }, 500);
+            }
+        });
+    }
+    
+    // Handle form submission with potential OTP requirement
+    form.addEventListener('submit', function(e) {
+        const hasOtpField = otpField.style.display !== 'none';
+        
+        // If OTP field is visible but empty, focus on it
+        if (hasOtpField && !otpInput.value.trim()) {
+            e.preventDefault();
+            otpInput.focus();
+            return;
+        }
+    });
+});
+</script>
